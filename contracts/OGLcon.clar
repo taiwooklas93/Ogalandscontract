@@ -1,4 +1,7 @@
 ;; OgaLand - Decentralized Land Registry for Africa
+;; Commit 2: Add title verification and dispute resolution
+;; Tackles land disputes and fake documentation issues prevalent in African cities
+
 ;; ============================================
 ;; CONSTANTS & ERROR CODES
 ;; ============================================
@@ -14,6 +17,8 @@
 (define-constant ERR_TITLE_DISPUTED (err u104))
 (define-constant ERR_NOT_OWNER (err u105))
 (define-constant ERR_TRANSFER_BLOCKED (err u106))
+(define-constant ERR_ALREADY_VERIFIED (err u107))
+(define-constant ERR_CANNOT_DISPUTE_OWN (err u108))
 
 ;; Title status constants
 (define-constant STATUS_PENDING u1)
@@ -27,8 +32,10 @@
 
 ;; Global counters
 (define-data-var next-title-id uint u1)
+(define-data-var next-dispute-id uint u1)
 (define-data-var total-titles uint u0)
 (define-data-var total-verified-titles uint u0)
+(define-data-var total-disputes uint u0)
 
 ;; Contract settings
 (define-data-var contract-active bool true)
@@ -76,6 +83,27 @@
     titles-verified: uint,
     registration-block: uint
   }
+)
+
+;; Dispute registry
+(define-map disputes
+  uint ;; dispute-id
+  {
+    title-id: uint,
+    complainant: principal,
+    reason: (string-utf8 500),
+    evidence-hash: (buff 32),
+    filed-block: uint,
+    resolved: bool,
+    resolution: (optional (string-utf8 500)),
+    resolver: (optional principal)
+  }
+)
+
+;; Title to disputes mapping
+(define-map title-disputes
+  uint ;; title-id
+  (list 10 uint) ;; List of dispute IDs
 )
 
 ;; ============================================
@@ -210,6 +238,130 @@
 )
 
 ;; ============================================
+;; TITLE VERIFICATION
+;; ============================================
+
+;; Verify a land title (authorized verifiers only)
+(define-public (verify-title (title-id uint))
+  (let
+    (
+      (title (unwrap! (map-get? land-titles title-id) ERR_NOT_FOUND))
+      (verifier contract-caller)
+      (verifier-data (unwrap! (map-get? authorized-verifiers verifier) ERR_UNAUTHORIZED))
+    )
+    (begin
+      ;; Check verifier is active
+      (asserts! (get active verifier-data) ERR_UNAUTHORIZED)
+      
+      ;; Check title is in pending status
+      (asserts! (is-eq (get status title) STATUS_PENDING) ERR_ALREADY_VERIFIED)
+      
+      ;; Update title status
+      (map-set land-titles title-id (merge title {
+        status: STATUS_VERIFIED,
+        verification-block: burn-block-height,
+        verifier: (some verifier)
+      }))
+      
+      ;; Update verifier stats
+      (map-set authorized-verifiers verifier (merge verifier-data {
+        titles-verified: (+ (get titles-verified verifier-data) u1)
+      }))
+      
+      ;; Update global counter
+      (var-set total-verified-titles (+ (var-get total-verified-titles) u1))
+      
+      (ok true)
+    )
+  )
+)
+
+;; ============================================
+;; DISPUTE RESOLUTION
+;; ============================================
+
+;; File a dispute against a title
+(define-public (file-dispute
+  (title-id uint)
+  (reason (string-utf8 500))
+  (evidence-hash (buff 32))
+)
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (title (unwrap! (map-get? land-titles title-id) ERR_NOT_FOUND))
+      (complainant contract-caller)
+      (title-dispute-list (default-to (list) (map-get? title-disputes title-id)))
+    )
+    (begin
+      ;; Validate inputs
+      (asserts! (> (len reason) u0) ERR_INVALID_INPUT)
+      
+      ;; Cannot dispute own title
+      (asserts! (not (is-eq complainant (get owner title))) ERR_CANNOT_DISPUTE_OWN)
+      
+      ;; Create dispute record
+      (map-set disputes dispute-id {
+        title-id: title-id,
+        complainant: complainant,
+        reason: reason,
+        evidence-hash: evidence-hash,
+        filed-block: burn-block-height,
+        resolved: false,
+        resolution: none,
+        resolver: none
+      })
+      
+      ;; Update title status to disputed
+      (map-set land-titles title-id (merge title { status: STATUS_DISPUTED }))
+      
+      ;; Add dispute to title's dispute list
+      (map-set title-disputes title-id
+        (unwrap-panic (as-max-len? (append title-dispute-list dispute-id) u10))
+      )
+      
+      ;; Update counters
+      (var-set next-dispute-id (+ dispute-id u1))
+      (var-set total-disputes (+ (var-get total-disputes) u1))
+      
+      (ok dispute-id)
+    )
+  )
+)
+
+;; Resolve a dispute (admin only)
+(define-public (resolve-dispute
+  (dispute-id uint)
+  (resolution (string-utf8 500))
+  (restore-verified bool)
+)
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_NOT_FOUND))
+      (title (unwrap! (map-get? land-titles (get title-id dispute)) ERR_NOT_FOUND))
+    )
+    (begin
+      (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+      (asserts! (not (get resolved dispute)) ERR_ALREADY_EXISTS)
+      
+      ;; Update dispute
+      (map-set disputes dispute-id (merge dispute {
+        resolved: true,
+        resolution: (some resolution),
+        resolver: (some contract-caller)
+      }))
+      
+      ;; Update title status based on resolution
+      (map-set land-titles (get title-id dispute) (merge title {
+        status: (if restore-verified STATUS_VERIFIED STATUS_DISPUTED)
+      }))
+      
+      (ok true)
+    )
+  )
+)
+
+;; ============================================
 ;; READ-ONLY FUNCTIONS
 ;; ============================================
 
@@ -233,12 +385,24 @@
   (map-get? authorized-verifiers verifier)
 )
 
+;; Get dispute information
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes dispute-id)
+)
+
+;; Get disputes for a title
+(define-read-only (get-title-disputes (title-id uint))
+  (map-get? title-disputes title-id)
+)
+
 ;; Get contract statistics
 (define-read-only (get-contract-stats)
   {
     total-titles: (var-get total-titles),
     total-verified-titles: (var-get total-verified-titles),
+    total-disputes: (var-get total-disputes),
     next-title-id: (var-get next-title-id),
+    next-dispute-id: (var-get next-dispute-id),
     contract-active: (var-get contract-active),
     verification-required: (var-get verification-required)
   }
@@ -248,6 +412,14 @@
 (define-read-only (is-title-verified (title-id uint))
   (match (map-get? land-titles title-id)
     title (is-eq (get status title) STATUS_VERIFIED)
+    false
+  )
+)
+
+;; Check if title is disputed
+(define-read-only (is-title-disputed (title-id uint))
+  (match (map-get? land-titles title-id)
+    title (is-eq (get status title) STATUS_DISPUTED)
     false
   )
 )
