@@ -1,6 +1,4 @@
 ;; OgaLand - Decentralized Land Registry for Africa
-;; Commit 2: Add title verification and dispute resolution
-;; Tackles land disputes and fake documentation issues prevalent in African cities
 
 ;; ============================================
 ;; CONSTANTS & ERROR CODES
